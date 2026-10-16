@@ -9,7 +9,8 @@ TUMBLE is a marble race on Ethereum. One buy of 0.01 ETH or more puts your tumbl
 The launch is Programmable's protected launch package, unchanged. `src/` and `lib/` hold the exact sources their builder writes, and `protection/` holds the compiler input and the artifacts.
 
 - `ProtectedLaunchTokenV1` is the token: a fixed-supply ERC-20 with the launch window's receiving limit of 2% per wallet for the first 5 minutes.
-- `ProtectedNativeInitializerV1` creates the ETH pool at a valuation of at least USD 15,000, locks the whole supply in it for good and makes the launch buy for the launch wallet.
+- `ProtectedNativeInitializerV1` creates the ETH pool at a valuation of at least USD 15,000, locks the whole supply in it for good and makes the launch buy for the launch wallet. The launch wallet burns those tokens right after the launch, so the launcher keeps none.
+- Six team wallets and the launch wallet are exempt from the extra opening fee of the first 30 seconds, as Programmable's package allows. They stay under the 2% limit like everyone else.
 - `ProtectedNative30HookV1` is the pool's hook. Every swap pays 3% of its gross ETH side, Programmable's 0.3% and 2.7% for the creator. For the first 30 seconds after the launch the buy fee starts at 99% and falls to 3%, and that extra part goes to Programmable's treasury. The creator fees accrue in the hook's fee vault and are paid to the launch wallet.
 
 ## The game
