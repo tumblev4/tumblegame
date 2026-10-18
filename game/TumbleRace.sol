@@ -37,10 +37,12 @@ interface IEthUsdFeed {
 ///         Tumblers. A wallet joins the race with join(): it needs at least `minimumToJoin()` tokens, what JOIN_VALUE
 ///         (0.0095 ETH, a 0.01 ETH buy after the fee) buys at the pool's price, and that amount is remembered as the
 ///         wallet's keepAtLeast. One tumbler per wallet; only wallets (no code, or an EIP-7702 delegation). The tumbler
-///         runs in every race that starts at least JOIN_DELAY after joining, while the wallet keeps at least keepAtLeast
-///         tokens: below that it is out. The contract cannot see the token's transfers, so the check is made when it
-///         matters: anyone may prune() wallets that fell below their line (the keeper does before every race start, so a
-///         race starts over tumblers that each hold their own tokens), and the drawn winner must hold the line at the
+///         runs from the next race that starts, and in every race after it while the wallet keeps at least keepAtLeast
+///         tokens: below that it is out. The start itself checks every wallet that joined since the last start, in the
+///         start's own transaction: one that holds its line runs from this race on, one that does not loses its tumbler.
+///         So tokens passed from wallet to wallet before a start make one tumbler, whoever starts the race. The contract
+///         cannot see the token's transfers, so later the check is made when it matters: anyone may prune() wallets that
+///         fell below their line (the keeper does as soon as it sees one), and the drawn winner must hold the line at the
 ///         payout. leave() takes a tumbler out at once. Slots keep their place: a freed slot is filled by the next join.
 ///
 ///         Every RACE_EVERY a race: the winner takes the prize, at most a cap that grows with the pot at Chainlink's
@@ -64,7 +66,7 @@ contract TumbleRace is ReentrancyGuardTransient {
     IPoolManager public constant POOL_MANAGER = IPoolManager(0x000000000004444c5dc75cB358380D2e3dE08A90);
     uint256 public constant RACE_EVERY = 15 minutes;
     uint256 public constant DRAW_DELAY = 5; // blocks from a race's start to its draw block
-    uint256 public constant JOIN_DELAY = 5 minutes; // a tumbler runs in the races that start this long after it joined
+    uint256 public constant MAX_JOIN_CHECKS = 500; // joins checked by one start; more wait for the next start
     uint256 public constant JOIN_VALUE = 0.0095 ether; // the tokens to hold: what a 0.01 ETH buy leaves after the 3% fee
     uint256 public constant MAX_TRIES = 256; // slot numbers tried per draw
     uint256 public constant OPERATIONS_SHARE = 7; // out of CREATOR_SHARE: 0.7% of a trade out of the creator's 2.7%
@@ -88,8 +90,11 @@ contract TumbleRace is ReentrancyGuardTransient {
 
     struct Tumbler {
         address owner; // 0: an empty slot
-        uint64 since; // when the wallet joined
+        uint48 since; // when the wallet joined
+        uint48 fromRace; // the first race it runs in, set by that race's start; WAITING until then
     }
+
+    uint48 public constant WAITING = type(uint48).max; // a tumbler that has not been checked in by a start yet
 
     IERC20 public immutable token;
     IProtectedHook public immutable hook;
@@ -107,6 +112,8 @@ contract TumbleRace is ReentrancyGuardTransient {
 
     Tumbler[] private _tumblers;
     uint256[] private _emptySlots;
+    address[] private _joins; // every join in order; the next start checks the ones from joinsChecked on
+    uint256 public joinsChecked;
     mapping(address => uint256) public tumblerSlot; // slot + 1; 0: no tumbler
     /// @notice The tokens a wallet keeps to keep its tumbler (0 without one).
     mapping(address => uint256) public keepAtLeast;
@@ -150,7 +157,7 @@ contract TumbleRace is ReentrancyGuardTransient {
     // ───────────── Tumblers ─────────────
 
     /// @notice Join the race with this wallet: it needs at least minimumToJoin() tokens, and keeps racing while it
-    ///         holds that many. It runs in the races that start JOIN_DELAY or more after this call.
+    ///         holds that many. It runs from the next race that starts, if it still holds them at that start.
     function join() external {
         if (!_isWallet(msg.sender)) revert NotAWallet();
         if (tumblerSlot[msg.sender] != 0) revert AlreadyRacing();
@@ -163,14 +170,15 @@ contract TumbleRace is ReentrancyGuardTransient {
         if (empty != 0) {
             slot = _emptySlots[empty - 1];
             _emptySlots.pop();
-            _tumblers[slot] = Tumbler(msg.sender, uint64(block.timestamp));
+            _tumblers[slot] = Tumbler(msg.sender, uint48(block.timestamp), WAITING);
         } else {
             slot = _tumblers.length;
-            _tumblers.push(Tumbler(msg.sender, uint64(block.timestamp)));
+            _tumblers.push(Tumbler(msg.sender, uint48(block.timestamp), WAITING));
         }
         tumblerSlot[msg.sender] = slot + 1;
         keepAtLeast[msg.sender] = keep;
         liveTumblers++;
+        _joins.push(msg.sender);
         emit TumblerGained(msg.sender, slot, keep);
     }
 
@@ -181,7 +189,7 @@ contract TumbleRace is ReentrancyGuardTransient {
     }
 
     /// @notice Take out the tumblers of wallets that no longer hold their keepAtLeast. Anyone may call; wallets that
-    ///         still hold the line are left alone. The keeper does this before every race start.
+    ///         still hold the line are left alone. The keeper does this as soon as it sees one.
     function prune(address[] calldata wallets) public {
         for (uint256 i; i < wallets.length; i++) {
             address w = wallets[i];
@@ -204,9 +212,16 @@ contract TumbleRace is ReentrancyGuardTransient {
         return _tumblers.length;
     }
 
-    function tumblerAt(uint256 slot) external view returns (address owner, uint64 since) {
+    /// @notice A slot's tumbler: its wallet (0 when empty), when it joined, and the first race it runs in (WAITING until
+    ///         the next start checks it in).
+    function tumblerAt(uint256 slot) external view returns (address owner, uint48 since, uint48 fromRace) {
         Tumbler memory t = _tumblers[slot];
-        return (t.owner, t.since);
+        return (t.owner, t.since, t.fromRace);
+    }
+
+    /// @notice Joins the next start will check (at most MAX_JOIN_CHECKS of them).
+    function joinsWaiting() external view returns (uint256) {
+        return _joins.length - joinsChecked;
     }
 
     /// @notice Up to `count` slots from `start`, for the website and the keeper.
@@ -217,14 +232,14 @@ contract TumbleRace is ReentrancyGuardTransient {
     }
 
     /// @notice The draw as a view: slot numbers from `seed` (keccak256(seed, i) for i = 0, 1, ...) among the first
-    ///         `slots` slots, until one holds a tumbler that joined JOIN_DELAY before `startedAt` and holds its line;
-    ///         at most `tries` numbers. (0, 0) if none.
-    function drawTumbler(bytes32 seed, uint256 slots, uint256 startedAt, uint256 tries) external view returns (address owner, uint256 slot) {
+    ///         `slots` slots, until one holds a tumbler that runs in race `id` and holds its line; at most `tries`
+    ///         numbers. (0, 0) if none.
+    function drawTumbler(bytes32 seed, uint256 slots, uint256 id, uint256 tries) external view returns (address owner, uint256 slot) {
         if (slots == 0 || slots > _tumblers.length) return (address(0), 0);
         for (uint256 i; i < tries; i++) {
             slot = uint256(keccak256(abi.encode(seed, i))) % slots;
             Tumbler memory t = _tumblers[slot];
-            if (_qualifies(t, startedAt)) return (t.owner, slot);
+            if (_qualifies(t, id)) return (t.owner, slot);
         }
         return (address(0), 0);
     }
@@ -293,9 +308,9 @@ contract TumbleRace is ReentrancyGuardTransient {
         emit TumblerLost(owner, s - 1);
     }
 
-    /// @dev A tumbler that joined JOIN_DELAY before the race started and whose wallet holds its line.
-    function _qualifies(Tumbler memory t, uint256 startedAt) private view returns (bool) {
-        return t.owner != address(0) && uint256(t.since) + JOIN_DELAY <= startedAt && token.balanceOf(t.owner) >= keepAtLeast[t.owner];
+    /// @dev A tumbler checked in by race `id`'s start or an earlier one, whose wallet holds its line.
+    function _qualifies(Tumbler memory t, uint256 id) private view returns (bool) {
+        return t.owner != address(0) && t.fromRace <= id && token.balanceOf(t.owner) >= keepAtLeast[t.owner];
     }
 
     /// @dev Moves the creator fees from the vault here when this contract is their recipient, then splits whatever
@@ -311,16 +326,35 @@ contract TumbleRace is ReentrancyGuardTransient {
     }
 
     function _start() private {
-        uint256 slots = _tumblers.length;
         uint256 potNow = booked - operationsOwed;
         nextRaceAt = block.timestamp + RACE_EVERY;
+        uint256 id = races + 1;
+        if (potNow >= MIN_POT) _checkJoins(id);
+        uint256 slots = _tumblers.length;
         if (liveTumblers == 0 || potNow < MIN_POT) {
             emit RaceSkipped(block.timestamp, slots, potNow);
             return;
         }
-        uint256 id = ++races;
+        races = id;
         pending = Pending(uint64(id), uint64(block.number + DRAW_DELAY), uint64(block.timestamp), uint64(slots));
         emit RaceStarted(id, block.number + DRAW_DELAY, slots, potNow);
+    }
+
+    /// @dev The start's check of the wallets that joined since the last start, in the start's own transaction: one that
+    ///      holds its line runs from race `id` on, one that does not loses its tumbler. Tokens passed from wallet to
+    ///      wallet before the start sit in one of them now, so they pass for one tumbler. At most MAX_JOIN_CHECKS
+    ///      joins; the rest wait for the next start.
+    function _checkJoins(uint256 id) private {
+        uint256 at = joinsChecked;
+        uint256 end = Math.min(_joins.length, at + MAX_JOIN_CHECKS);
+        for (; at < end; at++) {
+            address wallet = _joins[at];
+            uint256 s = tumblerSlot[wallet];
+            if (s == 0 || _tumblers[s - 1].fromRace != WAITING) continue; // left or pruned since, or checked in already
+            if (token.balanceOf(wallet) >= keepAtLeast[wallet]) _tumblers[s - 1].fromRace = uint48(id);
+            else _lose(wallet);
+        }
+        joinsChecked = at;
     }
 
     function _finish(Pending memory p, bytes calldata drawHeader) private {
@@ -331,7 +365,7 @@ contract TumbleRace is ReentrancyGuardTransient {
         }
         if (keccak256(drawHeader) != hash) revert BadHeader();
         bytes32 seed = _randaoOf(drawHeader);
-        (address winner, uint256 slot) = _draw(seed, p.slots, p.startedAt);
+        (address winner, uint256 slot) = _draw(seed, p.slots, p.id);
         if (winner == address(0)) {
             emit RaceVoid(p.id, 2);
             return;
@@ -351,12 +385,12 @@ contract TumbleRace is ReentrancyGuardTransient {
 
     /// @dev The draw at the finish: like drawTumbler, and a drawn wallet that no longer holds its line loses its
     ///      tumbler on the spot.
-    function _draw(bytes32 seed, uint256 slots, uint256 startedAt) private returns (address, uint256) {
+    function _draw(bytes32 seed, uint256 slots, uint256 id) private returns (address, uint256) {
         if (slots == 0 || slots > _tumblers.length) return (address(0), 0);
         for (uint256 i; i < MAX_TRIES; i++) {
             uint256 slot = uint256(keccak256(abi.encode(seed, i))) % slots;
             Tumbler memory t = _tumblers[slot];
-            if (t.owner == address(0) || uint256(t.since) + JOIN_DELAY > startedAt) continue;
+            if (t.owner == address(0) || t.fromRace > id) continue;
             if (token.balanceOf(t.owner) < keepAtLeast[t.owner]) {
                 _lose(t.owner);
                 continue;
